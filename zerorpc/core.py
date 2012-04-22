@@ -38,6 +38,8 @@ from .channel import ChannelMultiplexer, BufferedChannel
 from .socket import SocketBase
 from .heartbeat import HeartBeatOnChannel
 from .context import Context
+from .events import WrappedEvents
+from .context import Context
 
 
 class ServerBase(object):
@@ -54,7 +56,6 @@ class ServerBase(object):
         self._task_pool = gevent.pool.Pool(size=pool_size)
         self._acceptor_task = None
         self._methods = self._zerorpc_filter_methods(ServerBase, self, methods)
-
         self._inject_builtins()
         self._heartbeat_freq = heartbeat
 
@@ -326,6 +327,43 @@ class stream(DecoratorBase):
     pattern = PatternReqStream()
 
 
+class PatternSubServer():
+
+    def process_call(self, context, bufchan, event, functor):
+        methods = context.middleware_call_procedure(functor, *event.args)
+        wchannel = WrappedEvents(bufchan)
+        server = ServerBase(wchannel, methods, heartbeat=None)
+        bufchan.emit('SUBRPC', (None,))
+        try:
+            server.run()
+        finally:
+            server.close()
+            wchannel.close()
+
+    def accept_answer(self, event):
+        return event.name == 'SUBRPC'
+
+    def process_answer(self, context, bufchan, event, method, timeout,
+            raise_remote_error):
+        if event.name == 'ERR':
+            raise_remote_error(event)
+        wchannel = WrappedEvents(bufchan)
+        patterns = [PatternReqStream(), PatternSubServer(), PatternReqRep()]
+
+        class SubClient(ClientBase):
+            def close(self):
+                super(SubClient, self).close()
+                bufchan.close()
+                bufchan.channel.close()
+                bufchan.channel.channel.close()
+
+        return SubClient(wchannel, patterns)
+
+
+class sub(DecoratorBase):
+    pattern = PatternSubServer()
+
+
 class Server(SocketBase, ServerBase):
 
     def __init__(self, methods=None, name=None, context=None, pool_size=None,
@@ -343,7 +381,7 @@ class Server(SocketBase, ServerBase):
 
 
 class Client(SocketBase, ClientBase):
-    patterns = [PatternReqStream(), PatternReqRep()]
+    patterns = [PatternReqStream(), PatternSubServer(), PatternReqRep()]
 
     def __init__(self, connect_to=None, context=None, timeout=30, heartbeat=5,
             passive_heartbeat=False):
