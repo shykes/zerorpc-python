@@ -29,9 +29,12 @@ import json
 import sys
 import inspect
 import os
+import random
+import gevent
 from pprint import pprint
 
 import zerorpc
+from zerorpc import zmq
 
 
 parser = argparse.ArgumentParser(
@@ -161,6 +164,66 @@ def zerorpc_inspect(client, method=None, long_doc=True, include_argspec=True):
     longest_name_len = max(len(name) for name, doc in r)
     return (longest_name_len, r)
 
+def subrpc_shell(client):
+    try:
+        # We want to avoid making zerorpc dependent upon gevent_subprocess until
+        # the subrpc feature get somewhat widely used.
+        import gevent_subprocess
+    except ImportError as e:
+        print e
+        print 'You might want to install gevent_subprocess to',
+        print 'use the shubshell feature of the zerorpc''s cli.'
+        print 'ex: pip install gevent_subprocess'
+        return -1
+
+    # This ugly broken proxy assume that you will never try to run more than one
+    # zerorpc client at a time... No one should take this code as a good
+    # practice!
+
+    context_name = client._zerorpc_name()
+    class Proxy(zerorpc.SocketBase):
+        def __init__(self, channel):
+            self._channel = channel
+            self._zmqid = None
+            super(Proxy, self).__init__(zmq.XREP)
+
+        def _sender(self):
+            while True:
+                event = self._events.recv()
+                self._zmqid = event.header.get('zmqid', None)
+                self._channel.emit_event(event)
+
+        def _recver(self):
+            while True:
+                event = self._channel.recv()
+                self._events.emit_event(event, self._zmqid)
+
+        def run(self):
+            gevent.spawn(self._sender)
+            gevent.spawn(self._recver)
+
+    ipc_endpoint = '/tmp/zerorpc_subrpc_proxy_{0}'.format(random.random())
+    proxy_endpoint = 'ipc://{0}'.format(ipc_endpoint)
+    client_events = client._multiplexer._events
+    client._multiplexer.close()
+    proxy = Proxy(client_events)
+    proxy.bind(proxy_endpoint)
+    proxy.run()
+
+    print 'You are in a subshell, zerorpc\'s cli will now connect to this sub rpc',
+    print 'context by default. To close the context, simply exit the sub-shell.'
+    print 'ZERORPC_CONNECT_TO="{0}"'.format(proxy_endpoint)
+    print '-- subrpc open:', context_name
+    print
+    env = os.environ.copy()
+    env['ZERORPC_CONNECT_TO'] = proxy_endpoint
+    subshell = gevent_subprocess.Popen(os.environ.get('SHELL', 'sh'), env=env)
+    subshell.wait()
+    print '-- subrpc close:', context_name
+    try:
+        os.unlink(ipc_endpoint)
+    except OSError:
+        pass
 
 def run_client(args):
     client = zerorpc.Client(timeout=args.timeout, heartbeat=args.heartbeat,
@@ -187,12 +250,10 @@ def run_client(args):
     else:
         call_args = args.params
     results = client(args.command, *call_args)
-    if getattr(results, 'next', None) is None:
-        if args.print_json:
-            json.dump(results, sys.stdout)
-        else:
-            pprint(results)
-    else:
+    if isinstance(results, zerorpc.ClientBase):
+        # sub rpc
+        return subrpc_shell(results)
+    elif getattr(results, 'next', None) is not None:
         # streaming responses
         if args.print_json:
             first = True
@@ -207,20 +268,29 @@ def run_client(args):
         else:
             for result in results:
                 pprint(result)
+    else:
+        # req/rep
+        if args.print_json:
+            json.dump(results, sys.stdout)
+        else:
+            pprint(results)
 
 
 def main():
     args = parser.parse_args()
 
-    if args.bind or args.connect:
+    proxy_endpoint = os.environ.get('ZERORPC_CONNECT_TO', None)
+    if args.bind or args.connect or proxy_endpoint:
         if args.command:
             args.params.insert(0, args.command)
         args.command = args.address
         args.address = None
 
     if not (args.bind or args.connect or args.address):
-        parser.print_help()
-        return -1
+        if not proxy_endpoint:
+            parser.print_help()
+            return -1
+        args.address = proxy_endpoint
 
     if args.client:
         return run_client(args)
