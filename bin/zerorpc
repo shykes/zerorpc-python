@@ -164,33 +164,45 @@ def zerorpc_inspect(client, method=None, long_doc=True, include_argspec=True):
     longest_name_len = max(len(name) for name, doc in r)
     return (longest_name_len, r)
 
-def subrpc_shell(client):
+def context_shell(client):
     try:
         # We want to avoid making zerorpc dependent upon gevent_subprocess until
-        # the subrpc feature get somewhat widely used.
+        # the context feature conquer the world and become indispensable.
         import gevent_subprocess
     except ImportError as e:
         print e
         print 'You might want to install gevent_subprocess to',
-        print 'use the shubshell feature of the zerorpc''s cli.'
+        print 'use the sub shell feature of the zerorpc''s cli.'
         print 'ex: pip install gevent_subprocess'
         return -1
 
     # This ugly broken proxy assume that you will never try to run more than one
     # zerorpc client at a time... No one should take this code as a good
-    # practice!
+    # practice! Since the whole thing is just some convenience for zerorpc's cli
+    # it shouldn't be so much a big deal anyway.
 
     context_name = client._zerorpc_name()
     class Proxy(zerorpc.SocketBase):
         def __init__(self, channel):
             self._channel = channel
             self._zmqid = None
+            self._msgid = None
+            self._sender_task = None
+            self._recver_task = None
             super(Proxy, self).__init__(zmq.XREP)
+
+        def close(self):
+            if self._sender_task:
+                self._sender_task.kill()
+            if self._recver_task:
+                self._recver_task.kill()
+            super(Proxy, self).close()
 
         def _sender(self):
             while True:
                 event = self._events.recv()
                 self._zmqid = event.header.get('zmqid', None)
+                self._msgid = event.header.get('message_id', None)
                 self._channel.emit_event(event)
 
         def _recver(self):
@@ -199,10 +211,35 @@ def subrpc_shell(client):
                 self._events.emit_event(event, self._zmqid)
 
         def run(self):
-            gevent.spawn(self._sender)
-            gevent.spawn(self._recver)
+            self._sender_task = gevent.spawn(self._sender)
+            self._recver_task = gevent.spawn(self._recver)
 
-    ipc_endpoint = '/tmp/zerorpc_subrpc_proxy_{0}'.format(random.random())
+        def _sender_error(self):
+            # reply in loop that the context is closed...
+            while True:
+                event = self._events.recv()
+                self._zmqid = event.header.get('zmqid', None)
+                self._msgid = event.header.get('message_id', None)
+                self._events.emit('ERR', ('ContextClosed',
+                    'Context closed! You might want to exit your sub-shell and open'
+                    ' another one.', None),
+                        dict(zmqid=self._zmqid, response_to=self._msgid))
+
+        def error_mode(self, e):
+            if self._sender_task:
+                self._sender_task.kill()
+                self._sender_task = None
+            if self._recver_task:
+                self._recver_task.kill()
+                self._recver_task = None
+            # send an error over the wire to stop any pending zerorpc client on
+            # the other side of the IPC.
+            self._events.emit('ERR', (type(e).__name__, str(e), None),
+                        dict(zmqid=self._zmqid, response_to=self._msgid))
+            self._sender_task = gevent.spawn(self._sender_error)
+
+    # So here, we roughly inter-connect an IPC to the remote Context.
+    ipc_endpoint = '/tmp/zerorpc_context_proxy_{0}'.format(random.random())
     proxy_endpoint = 'ipc://{0}'.format(ipc_endpoint)
     client_events = client._multiplexer._events
     client._multiplexer.close()
@@ -213,17 +250,25 @@ def subrpc_shell(client):
     print 'You are in a subshell, zerorpc\'s cli will now connect to this sub rpc',
     print 'context by default. To close the context, simply exit the sub-shell.'
     print 'ZERORPC_CONNECT_TO="{0}"'.format(proxy_endpoint)
-    print '-- subrpc open:', context_name
+    print '-- context "{0}" open'.format(context_name)
     print
     env = os.environ.copy()
     env['ZERORPC_CONNECT_TO'] = proxy_endpoint
     subshell = gevent_subprocess.Popen(os.environ.get('SHELL', 'sh'), env=env)
-    subshell.wait()
-    print '-- subrpc close:', context_name
     try:
-        os.unlink(ipc_endpoint)
-    except OSError:
-        pass
+        subshell.wait()
+    except Exception as e:
+        print '-- '
+        print '-- context "{0}" closed on error: {1}'.format(context_name, e)
+        proxy.error_mode(e)
+        subshell.wait()
+    else:
+        print '-- context "{0}" closed'.format(context_name)
+    finally:
+        try:
+            os.unlink(ipc_endpoint)
+        except OSError:
+            pass
 
 def run_client(args):
     client = zerorpc.Client(timeout=args.timeout, heartbeat=args.heartbeat,
@@ -251,8 +296,8 @@ def run_client(args):
         call_args = args.params
     results = client(args.command, *call_args)
     if isinstance(results, zerorpc.ClientBase):
-        # sub rpc
-        return subrpc_shell(results)
+        # context
+        return context_shell(results)
     elif getattr(results, 'next', None) is not None:
         # streaming responses
         if args.print_json:
