@@ -43,7 +43,7 @@ import patterns
 class ServerBase(object):
 
     def __init__(self, channel, methods=None, name=None, context=None,
-            pool_size=None, heartbeat=5):
+            pool_size=None, heartbeat=5, allow_remote_stop=False):
         self._multiplexer = ChannelMultiplexer(channel)
 
         if methods is None:
@@ -56,6 +56,9 @@ class ServerBase(object):
         self._methods = self._zerorpc_filter_methods(ServerBase, self, methods)
         self._inject_builtins()
         self._heartbeat_freq = heartbeat
+
+        if allow_remote_stop:
+            self._methods['_zerorpc_stop'] = self.stop
 
         for (k, functor) in self._methods.items():
             if not isinstance(functor, DecoratorBase):

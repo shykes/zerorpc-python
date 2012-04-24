@@ -77,7 +77,8 @@ class ReqContext():
         context_gen =context.middleware_call_procedure(functor, *event.args)
         methods = context_gen.next()
         wchannel = WrappedEvents(bufchan)
-        server = core.ServerBase(wchannel, methods, heartbeat=None)
+        server = core.ServerBase(wchannel, methods, heartbeat=None,
+                allow_remote_stop=True)
         bufchan.emit('CTX', (None,))
         try:
             server.run()
@@ -105,13 +106,32 @@ class ReqContext():
         wchannel = WrappedEvents(bufchan)
 
         class ContextClient(core.ClientBase):
+            def __init__(self, channel):
+                self._closed = False
+                super(ContextClient, self).__init__(channel, heartbeat=None)
+
             def close(self):
-                self._channel.emit('CTX_CLOSE', (None,))
+                if self._closed:
+                    return
+                self('_zerorpc_stop')
                 super(ContextClient, self).close()
+                wchannel.close()
                 bufchan.close()
                 bufchan.channel.close()
                 bufchan.channel.channel.close()
+                self._closed = True
 
-        return ContextClient(wchannel, heartbeat=None)
+            def __call__(self, method, *args, **kargs):
+                if self._closed:
+                    raise ValueError('I/O operation on closed context')
+                return super(ContextClient, self).__call__(method, *args, **kargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.close()
+
+        return ContextClient(wchannel)
 
 patterns_list = [ReqContext(), ReqStream(), ReqRep()]
