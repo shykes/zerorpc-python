@@ -1,0 +1,25 @@
+#!/usr/bin/env python
+
+import sys
+import json
+import types
+
+import zerorpc
+
+address, expression = sys.argv[1], sys.argv[2]
+
+c = zerorpc.Client(address)
+
+methods = dict((key, getattr(c, key)) for key in c._zerorpc_list())
+methods['_zerorpc_list'] = c._zerorpc_list
+
+
+result = eval(expression, methods, methods)
+try:
+    if isinstance(result, types.GeneratorType):
+        for item in result:
+            print json.dumps(item)
+    else:
+        print json.dumps(result)
+except TypeError:
+    print str(result)
