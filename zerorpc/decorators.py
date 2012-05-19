@@ -67,3 +67,19 @@ class stream(DecoratorBase):
 
 class context(DecoratorBase):
     pattern = ReqContext()
+
+
+##
+## Use @anytype on a zerorpc method to auto-discover the best transport method
+## based on the return value.
+##
+##  * If method returns a generator, send as a stream (same as @stream)
+##  * If method returns a RemoteObject or ContextClient, send as a context (same as @context)
+##  * Else send it as a usual value
+##
+## This means that @anytype can be used indiscriminately for all methods, and will always
+## work as expected.
+##
+
+class anytype(DecoratorBase):
+    pattern = AnyType()

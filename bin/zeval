@@ -19,6 +19,9 @@ try:
     if isinstance(result, types.GeneratorType):
         for item in result:
             print json.dumps(item)
+    elif hasattr(result, '_zerorpc_list'):
+        for method in result._zerorpc_list():
+            print method
     else:
         print json.dumps(result)
 except TypeError:
